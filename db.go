@@ -1,11 +1,15 @@
 package ldb
 
 import (
+	"archive/zip"
 	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math"
+	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/syndtr/goleveldb/leveldb"
@@ -725,6 +729,83 @@ func (d *DB) Compact() error {
 	return d.db.CompactRange(util.Range{Start: nil, Limit: nil})
 }
 
+// CompactZip (goleveldb) 获取数据快照，全量写入新 DB 实例完成极致压缩，随后打包为 ZIP
+func (d *DB) CompactZip(dstPath, zipPath string) error {
+	if d == nil || d.db == nil {
+		return errors.New("nil database")
+	}
+
+	// 1. 触发主库全量 Compaction（可选，因为后面会全量重建，但为了遵循你的接口逻辑保留）
+	err := d.db.CompactRange(util.Range{Start: nil, Limit: nil})
+	if err != nil {
+		return err
+	}
+
+	isTemp := false
+	if dstPath == "" {
+		dstPath = filepath.Join(os.TempDir(), "leveldb_compact_tmp")
+		isTemp = true
+	}
+	_ = os.RemoveAll(dstPath)
+
+	// 2. 获取主库的一致性读快照
+	snapshot, err := d.db.GetSnapshot()
+	if err != nil {
+		return err
+	}
+	defer snapshot.Release()
+
+	// 创建用于承载压缩数据的新 DB
+	dstDB, err := leveldb.OpenFile(dstPath, nil)
+	if err != nil {
+		return err
+	}
+
+	// 3. 全量迭代并写入新 DB (模拟 bbolt 的重新填充)
+	iter := snapshot.NewIterator(nil, nil)
+	batch := new(leveldb.Batch)
+
+	for iter.Next() {
+		batch.Put(iter.Key(), iter.Value())
+		if batch.Len() >= 10000 { // 批量提交，避免内存爆满
+			if err := dstDB.Write(batch, nil); err != nil {
+				iter.Release()
+				dstDB.Close()
+				return err
+			}
+			batch.Reset()
+		}
+	}
+	iter.Release()
+
+	if err := iter.Error(); err != nil {
+		dstDB.Close()
+		return err
+	}
+	if batch.Len() > 0 {
+		if err := dstDB.Write(batch, nil); err != nil {
+			dstDB.Close()
+			return err
+		}
+	}
+	// 必须关闭新 DB，确保文件被刷入磁盘且锁被释放
+	dstDB.Close()
+
+	defer func() {
+		if isTemp {
+			_ = os.RemoveAll(dstPath)
+		}
+	}()
+
+	// 4. 将新的紧凑型 DB 目录打包为 zip 文件
+	if err := zipDirectory(dstPath, zipPath); err != nil {
+		_ = os.Remove(zipPath)
+		return err
+	}
+
+	return nil
+}
+
 // -----------------------
 // 辅助与编码解码函数 (同上保持不变)
 // -----------------------
@@ -917,4 +998,72 @@ func keyUpperBoundToBuf(b []byte, bufPtr *[]byte) []byte {
 		}
 	}
 	return nil
+}
+
+// zipDirectory 辅助函数：将一个包含多文件的目录结构打包为 .zip
+func zipDirectory(sourceDir, zipPath string) (err error) {
+	outFile, err := os.Create(zipPath)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := outFile.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
+
+	zipWriter := zip.NewWriter(outFile)
+	defer func() {
+		if cerr := zipWriter.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}()
+
+	return filepath.Walk(sourceDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// 获取相对于根目录的相对路径
+		relPath, err := filepath.Rel(sourceDir, path)
+		if err != nil {
+			return err
+		}
+		if relPath == "." {
+			return nil // 跳过根目录本身
+		}
+
+		// ZIP 规范要求使用正斜杠 (/)
+		relPath = filepath.ToSlash(relPath)
+		if info.IsDir() {
+			relPath += "/"
+		}
+
+		header, err := zip.FileInfoHeader(info)
+		if err != nil {
+			return err
+		}
+		header.Name = relPath
+		header.Method = zip.Deflate
+
+		writer, err := zipWriter.CreateHeader(header)
+		if err != nil {
+			return err
+		}
+
+		// 如果是目录，写入 Header 后即可返回
+		if info.IsDir() {
+			return nil
+		}
+
+		// 如果是文件，拷贝文件内容
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+
+		_, err = io.Copy(writer, file)
+		return err
+	})
 }
