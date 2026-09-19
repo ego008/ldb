@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"unsafe"
 
 	"github.com/syndtr/goleveldb/leveldb"
 	"github.com/syndtr/goleveldb/leveldb/iterator"
@@ -203,6 +204,19 @@ func (d *DB) HIncr(tx *Tx, name string, key []byte, step int64) (uint64, error) 
 		return 0, err
 	}
 	return newVal, nil
+}
+
+func (d *DB) HKeyExist(tx *Tx, name string, key []byte) bool {
+	bufPtr := keyBufPool.Get().(*[]byte)
+	defer keyBufPool.Put(bufPtr)
+
+	reallyKey, err := encodeKey(bucketHash, name, key, bufPtr)
+	if err != nil {
+		return false
+	}
+
+	_, err = tx.Get(reallyKey)
+	return err == nil
 }
 
 func (d *DB) HGetFunc(tx *Tx, name string, key []byte, fn func(val []byte) error) error {
@@ -931,6 +945,22 @@ func B2i(v []byte) uint64 {
 		return 0
 	}
 	return binary.BigEndian.Uint64(v)
+}
+
+// B2s converts byte slice to a string without memory allocation (Go 1.20+ safe).
+func B2s(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	return unsafe.String(unsafe.SliceData(b), len(b))
+}
+
+// S2b converts string to a byte slice without memory allocation (Go 1.20+ safe).
+func S2b(s string) []byte {
+	if len(s) == 0 {
+		return nil
+	}
+	return unsafe.Slice(unsafe.StringData(s), len(s))
 }
 
 func parseUintBytes(b []byte) (uint64, error) {
